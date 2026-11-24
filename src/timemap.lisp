@@ -65,19 +65,82 @@
   (off '() :type list :read-only t)
   (tempo nil :read-only t))
 
+(defun %timed-event-p (element)
+  "True when ELEMENT is a timed event: an event that is not a grace event."
+  (and (typep element 'score-protocol:event)
+       (not (and (typep element 'score-protocol:sounding-event)
+                 (score-protocol:event-grace element)))))
+
+(defun %tempo-changes (score)
+  "SCORE's tempo change points (file header), ((offset . tempo) ...) in time
+order; of two at one instant the later in bar and TEMPO order comes last."
+  (stable-sort
+   (loop for bar from (score-protocol:score-first-bar score) to (score-protocol:score-last-bar score)
+         for start = (score-protocol:bar-start score bar)
+         nconc (loop for mark in (score-protocol:measure-info-tempo
+                                  (score-protocol:bar-measure score bar))
+                     for tempo = (score-protocol:tempo-mark-tempo mark)
+                     when tempo
+                       collect (cons (+ start (score-protocol:tempo-mark-offset mark)) tempo)))
+   #'< :key #'car))
+
+(defun %ms-and-tempo (x changes)
+  "(values MS(X) tempo-in-force-at-X) over the change points CHANGES: exact."
+  (let ((seconds 0) (from 0) (tempo +default-tempo+))
+    (loop for (offset . next) in changes
+          while (<= offset x)
+          do (incf seconds (music-theory:duration-seconds (- offset from) tempo))
+             (setf from offset
+                   tempo next))
+    (values (* 1000 (+ seconds (music-theory:duration-seconds (- x from) tempo)))
+            tempo)))
+
 (defun score-timemap (score)
   "The timemap of SCORE without unfolding (file header)."
-  (declare (ignore score))
-  (%en0-pending 'score-timemap))
+  (check-type score score-protocol:score)
+  (let ((changes (%tempo-changes score))
+        (on (make-hash-table))          ; instant → ids, newest first (EQL: rationals)
+        (off (make-hash-table))
+        (instants '()))
+    (dolist (element (score-protocol:score-elements score))
+      (when (%timed-event-p element)
+        (let* ((id (score-protocol:element-id element))
+               (start (score-protocol:absolute-offset
+                       score (score-protocol:element-position score id)))
+               (end (+ start (score-protocol:event-duration element))))
+          (push id (gethash start on))
+          (push id (gethash end off))
+          (push start instants)
+          (push end instants))))
+    (loop for x in (sort (remove-duplicates instants) #'<)
+          collect (multiple-value-bind (ms tempo) (%ms-and-tempo x changes)
+                    (make-timemap-entry :onset ms
+                                        :on (reverse (gethash x on))
+                                        :off (reverse (gethash x off))
+                                        :tempo tempo)))))
 
 (defgeneric render-timemap (engine score &key unfold)
   (:documentation "SCORE's timemap, unfolded into playback order by default. The file
 header of timemap.lisp has the rules."))
 
 (defmethod render-timemap ((engine null) score &key (unfold t))
-  (declare (ignore score unfold))
-  (%en0-pending 'render-timemap/null))
+  (render-timemap (ensure-engine nil) score :unfold unfold))
 
 (defmethod render-timemap ((engine engrave-engine) score &key (unfold t))
-  (declare (ignore score unfold))
-  (%en0-pending 'render-timemap/engrave-engine))
+  ;; 1. The engine, as in RENDER-SVG.
+  (let ((e (ensure-engine engine)))
+    (unless (eq e engine)
+      (return-from render-timemap (render-timemap e score :unfold unfold))))
+  ;; 2. The score.
+  (check-type score score-protocol:score)
+  ;; 3. Unfolded into playback order, under the source ids; or as it stands.
+  (if unfold
+      (multiple-value-bind (view id-map) (score-protocol:unfold score)
+        (flet ((source (id) (values (fset:lookup id-map id))))
+          (mapcar (lambda (entry)
+                    (make-timemap-entry :onset (timemap-entry-onset entry)
+                                        :on (mapcar #'source (timemap-entry-on entry))
+                                        :off (mapcar #'source (timemap-entry-off entry))
+                                        :tempo (timemap-entry-tempo entry)))
+                  (score-timemap view))))
+      (score-timemap score)))

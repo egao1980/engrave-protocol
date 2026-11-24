@@ -45,12 +45,76 @@
   (scale 100 :type (integer 1 1000) :read-only t)
   (system-breaks :auto :read-only t))
 
+(defparameter +layout-keys+ '(:page-size :margins :scale :system-breaks)
+  "The keywords MAKE-LAYOUT takes, so the keys of an ENSURE-LAYOUT plist. Data.")
+
+(defun %proper-list-p (object)
+  "True when OBJECT is a proper list (NIL included)."
+  (loop for tail = object then (cdr tail)
+        while (consp tail)
+        finally (return (null tail))))
+
+(defun %length-p (object)
+  "True when OBJECT is a length: a rational whose tenfold is an integer."
+  (and (rationalp object) (integerp (* 10 object))))
+
+(defun %refuse-layout-option (option value)
+  (error 'invalid-render-option :option option :value value))
+
+(defun %layout-page-size (page-size)
+  "PAGE-SIZE as a fresh (width height), or INVALID-RENDER-OPTION."
+  (let ((named (and (symbolp page-size) (assoc page-size +page-sizes+))))
+    (cond (named (copy-list (rest named)))
+          ((and (%proper-list-p page-size)
+                (= 2 (length page-size))
+                (every (lambda (x) (and (%length-p x) (plusp x))) page-size))
+           (copy-list page-size))
+          (t (%refuse-layout-option :page-size page-size)))))
+
+(defun %layout-margins (margins width height)
+  "MARGINS as a fresh (top right bottom left) that fits WIDTH x HEIGHT, or
+INVALID-RENDER-OPTION."
+  (flet ((side-p (x) (and (%length-p x) (>= x 0))))
+    (let ((sides (cond ((side-p margins) (list margins margins margins margins))
+                       ((and (%proper-list-p margins)
+                             (= 4 (length margins))
+                             (every #'side-p margins))
+                        (copy-list margins))
+                       (t (%refuse-layout-option :margins margins)))))
+      (destructuring-bind (top right bottom left) sides
+        (unless (and (< (+ left right) width) (< (+ top bottom) height))
+          (%refuse-layout-option :margins margins)))
+      sides)))
+
+(defun %layout-system-breaks (system-breaks)
+  "SYSTEM-BREAKS as :AUTO or a fresh list of distinct ids, or INVALID-RENDER-OPTION."
+  (cond ((eq system-breaks :auto) :auto)
+        ((and (%proper-list-p system-breaks)
+              (every #'score-protocol:valid-id-p system-breaks)
+              (= (length system-breaks)
+                 (length (remove-duplicates system-breaks :test #'string=))))
+         (copy-list system-breaks))
+        (t (%refuse-layout-option :system-breaks system-breaks))))
+
 (defun make-layout (&key (page-size :a4) (margins 10) (scale 100) (system-breaks :auto))
   "A checked LAYOUT (file header)."
-  (declare (ignore page-size margins scale system-breaks))
-  (%en0-pending 'make-layout))
+  (let* ((size (%layout-page-size page-size))
+         (sides (%layout-margins margins (first size) (second size))))
+    (unless (typep scale '(integer 1 1000))
+      (%refuse-layout-option :scale scale))
+    (%make-layout size sides scale (%layout-system-breaks system-breaks))))
+
+(defun %layout-plist-p (object)
+  "True when OBJECT is a proper plist whose keys MAKE-LAYOUT takes."
+  (and (%proper-list-p object)
+       (evenp (length object))
+       (loop for key in object by #'cddr
+             always (member key +layout-keys+))))
 
 (defun ensure-layout (designator)
   "NIL, a LAYOUT or a MAKE-LAYOUT plist → a LAYOUT (file header)."
-  (declare (ignore designator))
-  (%en0-pending 'ensure-layout))
+  (cond ((null designator) (make-layout))
+        ((layout-p designator) designator)
+        ((and (consp designator) (%layout-plist-p designator))
+         (apply #'make-layout designator))
+        (t (%refuse-layout-option :layout designator))))

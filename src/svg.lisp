@@ -101,12 +101,48 @@
   "The root element of PAGE's SVG document."
   (stack-xml:document-root-element (svg-page-document page)))
 
+(defun %no-namespace-p (string)
+  "True for NIL or \"\": no prefix, no namespace."
+  (or (null string) (equal string "")))
+
+(defun %exact-attr (element name)
+  "The value of ELEMENT's attribute whose local name is NAME (STRING=) and that
+has no prefix and no namespace, or NIL. Unlike STACK-XML:XML-ATTR this is
+case-sensitive and never matches a prefixed attribute such as xml:id."
+  (let ((attribute (find-if (lambda (a)
+                              (and (stack-xml:xml-attribute-p a)
+                                   (string= name (stack-xml:xml-attribute-local-name a))
+                                   (%no-namespace-p (stack-xml:xml-attribute-prefix a))
+                                   (%no-namespace-p (stack-xml:xml-attribute-namespace-uri a))))
+                            (stack-xml:xml-element-attributes element))))
+    (and attribute (stack-xml:xml-attribute-value attribute))))
+
+(defun %svg-id (element)
+  "ELEMENT's id attribute (file header), or NIL."
+  (%exact-attr element "id"))
+
+(defun %walk-elements (function element)
+  "Call FUNCTION on ELEMENT and every element below it, in pre-order (text and
+other nodes are skipped). ELEMENT may be NIL."
+  (when (stack-xml:xml-element-p element)
+    (funcall function element)
+    (dolist (child (stack-xml:xml-element-children element))
+      (%walk-elements function child))))
+
 (defun svg-page-ids (page)
   "Every id attribute value on PAGE, in document order (file header)."
-  (declare (ignore page))
-  (%en0-pending 'svg-page-ids))
+  (let ((ids '()))
+    (%walk-elements (lambda (element)
+                      (let ((id (%svg-id element)))
+                        (when id (push id ids))))
+                    (svg-page-root page))
+    (nreverse ids)))
 
 (defun find-svg-element (page svg-id)
   "The first element of PAGE whose id is SVG-ID, or NIL (file header)."
-  (declare (ignore page svg-id))
-  (%en0-pending 'find-svg-element))
+  (%walk-elements (lambda (element)
+                    (let ((id (%svg-id element)))
+                      (when (and id (string= id svg-id))
+                        (return-from find-svg-element element))))
+                  (svg-page-root page))
+  nil)

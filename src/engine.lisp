@@ -73,11 +73,32 @@ in slots and implement ENGINE-RENDER-PAGES."))
 ids to lists of (page-number . svg-id). PAGE, when not NIL, is the one page
 the caller wants. The file header of engine.lisp has the rules."))
 
+(defun %read-replacement (what)
+  "The :INTERACTIVE argument list of a USE-VALUE restart: a form read from
+*QUERY-IO* and evaluated, for WHAT (a string naming the value)."
+  (format *query-io* "~&~A (a form to evaluate): " what)
+  (finish-output *query-io*)
+  (list (eval (read *query-io*))))
+
 (defun ensure-engine (engine)
   "ENGINE, or *ENGRAVE-ENGINE* for NIL, when it can render; else
 ENGINE-UNAVAILABLE inside a USE-VALUE restart (file header)."
-  (declare (ignore engine))
-  (%en0-pending 'ensure-engine))
+  (let ((e (or engine *engrave-engine*)))
+    (cond ((and (typep e 'engrave-engine) (engine-available-p e)) e)
+          ((or (null e) (typep e 'engrave-engine))
+           ;; The clause body runs after the unwind, so a replacement that is
+           ;; itself unavailable signals afresh, with no restart left behind.
+           (restart-case
+               (error 'engine-unavailable
+                      :engine e
+                      :reason (if e
+                                  "the engine cannot render here (ENGINE-AVAILABLE-P is false)"
+                                  "no engine given and *ENGRAVE-ENGINE* is NIL"))
+             (use-value (replacement)
+               :report "Use another engine."
+               :interactive (lambda () (%read-replacement "Engine"))
+               (ensure-engine replacement))))
+          (t (error 'type-error :datum e :expected-type '(or null engrave-engine))))))
 
 (defun %engine-label (engine)
   "ENGINE's name for a condition report, or NIL."

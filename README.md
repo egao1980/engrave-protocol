@@ -2,7 +2,7 @@
 
 Engraving for cl-stack: a [score-protocol](https://github.com/egao1980/score-protocol) score (or one of its views) becomes SVG pages whose element ids lead back to the score, a timemap for playback cursors, and PDF. Rendering happens in an engine behind the protocol; the first native engine is planned as a separate backend.
 
-**Status:** EN0 contract (0.1.0): the API, the rules in the file headers of `src/`, `%en0-pending` stubs, and the Rove suite. The design is in the capability brief [cl-stack/docs/capabilities/engrave.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/engrave.md).
+**Status:** EN0 (0.1.0) implemented: the API, the rules in the file headers of `src/`, the reference `null-engine`, and the Rove suite. The design is in the capability brief [cl-stack/docs/capabilities/engrave.md](https://github.com/egao1980/cl-stack/blob/main/docs/capabilities/engrave.md).
 
 ```lisp
 (asdf:load-system "engrave-protocol")

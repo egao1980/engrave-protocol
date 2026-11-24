@@ -79,18 +79,95 @@ has the rules."))
   (:documentation "Engrave SCORE and print it → PDF octets. The file header of
 render.lisp has the rules."))
 
+(defun %measure-ids (score)
+  "The ids of SCORE's measures, in measure-map order."
+  (mapcar #'score-protocol:element-id
+          (fset:convert 'list (score-protocol:score-measure-map score))))
+
+(defun %source-id-map (map view-map)
+  "MAP (view ids → refs) with each key replaced by its source id through
+VIEW-MAP; keys VIEW-MAP lacks are dropped, values kept as they are."
+  (let ((out (fset:empty-map)))
+    (fset:do-map (id refs map)
+      (multiple-value-bind (source found) (fset:lookup view-map id)
+        (when found
+          (setf out (fset:with out source refs)))))
+    out))
+
+(defparameter +pdf-magic+ '(37 80 68 70 45)
+  "The first five bytes of a PDF: \"%PDF-\". Data.")
+
+(defun %pdf-octets-p (object)
+  "True when OBJECT is an (unsigned-byte 8) vector starting with \"%PDF-\"."
+  (and (typep object '(vector (unsigned-byte 8)))
+       (>= (length object) (length +pdf-magic+))
+       (loop for byte in +pdf-magic+
+             for i from 0
+             always (= byte (aref object i)))))
+
 (defmethod render-svg ((engine null) score &key (view :choral) page layout parts)
-  (declare (ignore score view page layout parts))
-  (%en0-pending 'render-svg/null))
+  (render-svg (ensure-engine nil) score :view view :page page :layout layout :parts parts))
 
 (defmethod render-svg ((engine engrave-engine) score &key (view :choral) page layout parts)
-  (declare (ignore score view page layout parts))
-  (%en0-pending 'render-svg/engrave-engine))
+  ;; 1. The engine; a replacement taken through USE-VALUE renders instead.
+  (let ((e (ensure-engine engine)))
+    (unless (eq e engine)
+      (return-from render-svg
+        (render-svg e score :view view :page page :layout layout :parts parts))))
+  ;; 2. The score.
+  (check-type score score-protocol:score)
+  ;; 3. The layout.
+  (let ((l (ensure-layout layout)))
+    ;; 4. The view.
+    (multiple-value-bind (v view-map) (engrave-view score :view view :parts parts)
+      ;; 5. System breaks name measures of the view.
+      (let ((breaks (layout-system-breaks l)))
+        (when (listp breaks)
+          (let ((measures (%measure-ids v)))
+            (unless (every (lambda (id) (member id measures :test #'string=)) breaks)
+              (error 'invalid-render-option :option :system-breaks :value breaks :engine engine)))))
+      ;; 6. The page number.
+      (unless (typep page '(or null (integer 1)))
+        (error 'invalid-render-option :option :page :value page :engine engine))
+      ;; 7. The engine draws.
+      (multiple-value-bind (pages map) (engine-render-pages engine v l :page page)
+        ;; 8. The page asked for exists.
+        (let ((selected (and page (find page pages :key #'svg-page-number))))
+          (when (and page (null selected))
+            (error 'invalid-render-option :option :page :value page :engine engine))
+          ;; 9. The pages, and the id map in SCORE's ids.
+          (values (if page (list selected) pages)
+                  (%source-id-map map view-map)))))))
 
 (defmethod render-pdf ((engine null) score &key (view :choral) layout parts printer)
-  (declare (ignore score view layout parts printer))
-  (%en0-pending 'render-pdf/null))
+  (render-pdf (ensure-engine nil) score :view view :layout layout :parts parts :printer printer))
 
 (defmethod render-pdf ((engine engrave-engine) score &key (view :choral) layout parts printer)
-  (declare (ignore score view layout parts printer))
-  (%en0-pending 'render-pdf/engrave-engine))
+  ;; 1. The engine, as in RENDER-SVG.
+  (let ((e (ensure-engine engine)))
+    (unless (eq e engine)
+      (return-from render-pdf
+        (render-pdf e score :view view :layout layout :parts parts :printer printer))))
+  ;; 2. The printer, before anything is rendered; NIL signals again.
+  (let ((p (or printer *pdf-printer*)))
+    (loop until p
+          do (restart-case
+                 (error 'printer-unavailable
+                        :engine engine
+                        :reason "no :PRINTER given and *PDF-PRINTER* is NIL")
+               (use-value (replacement)
+                 :report "Use another printer."
+                 :interactive (lambda () (%read-replacement "Printer"))
+                 (setf p replacement))))
+    ;; 3. The pages.
+    (let* ((l (ensure-layout layout))
+           (pages (values (render-svg engine score :view view :layout l :parts parts)))
+           ;; 4. The printer prints them.
+           (octets (print-pages p pages l)))
+      ;; 5. They must be PDF octets.
+      (unless (%pdf-octets-p octets)
+        (error 'engine-render-error
+               :engine engine
+               :message "the printer returned no PDF (no (unsigned-byte 8) vector starting with %PDF-)"))
+      ;; 6.
+      octets)))

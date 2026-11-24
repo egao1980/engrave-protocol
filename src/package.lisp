@@ -50,8 +50,3 @@ backends (engrave-backend-verovio).")
    #:check-engraving #:check-timemap))
 
 (in-package #:engrave-protocol)
-
-(defun %en0-pending (name)
-  "Contract stub for slice EN0. Every call is replaced by the implementation,
-then this function is deleted."
-  (error "engrave-protocol EN0 pending: ~A" name))

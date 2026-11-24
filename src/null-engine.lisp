@@ -98,6 +98,257 @@ header)."))
 (defmethod engine-name ((engine null-engine))
   "null")
 
+;;; Numbers ------------------------------------------------------------------------
+
+(defun %svg-number (x)
+  "X in decimal for an attribute (file header): an integer as itself, another
+rational rounded to hundredths, with no trailing zeros. Never a ratio."
+  (if (integerp x)
+      (format nil "~D" x)
+      (let ((hundredths (round (* x 100))))
+        (multiple-value-bind (whole fraction) (truncate (abs hundredths) 100)
+          (format nil "~:[~;-~]~D~A"
+                  (minusp hundredths) whole
+                  (cond ((zerop fraction) "")
+                        ((zerop (mod fraction 10)) (format nil ".~D" (floor fraction 10)))
+                        (t (format nil ".~2,'0D" fraction))))))))
+
+;;; Frame: geometry, systems and pages, from the measure map and the layout -----------
+
+(defstruct (%frame (:constructor %make-frame) (:copier nil) (:predicate nil))
+  "The null engine's plan of a rendering, in tenths of a millimetre."
+  (width 0 :read-only t)          ; W
+  (height 0 :read-only t)         ; H
+  (page-width 0 :read-only t)     ; millimetres
+  (page-height 0 :read-only t)
+  (top 0 :read-only t)
+  (left 0 :read-only t)
+  (measure-width 0 :read-only t)  ; MW
+  (system-height 0 :read-only t)  ; SH
+  (rect-height 0 :read-only t)    ; 100 N f
+  (systems '() :read-only t)      ; lists of MEASURE-INFOs, system J = position + 1
+  (pages '() :read-only t))       ; lists of (J . measures), page k = position + 1
+
+(defun %chunk (list size)
+  "LIST in runs of SIZE (the last run may be shorter)."
+  (loop for tail = list then (nthcdr size tail)
+        while tail
+        collect (subseq tail 0 (min size (length tail)))))
+
+(defun %break-systems (measures breaks)
+  "MEASURES split before the first one and before each one whose id is in BREAKS."
+  (let ((systems '()) (run '()))
+    (dolist (measure measures)
+      (when (and run (member (score-protocol:element-id measure) breaks :test #'string=))
+        (push (nreverse run) systems)
+        (setf run '()))
+      (push measure run))
+    (when run (push (nreverse run) systems))
+    (nreverse systems)))
+
+(defun %layout-frame (view layout)
+  "The geometry, systems and pages of VIEW drawn with LAYOUT (file header)."
+  (destructuring-bind (page-width page-height) (layout-page-size layout)
+    (destructuring-bind (top right bottom left)
+        (mapcar (lambda (x) (* 10 x)) (layout-margins layout))
+      (let* ((scale (layout-scale layout))
+             (w (* 10 page-width))
+             (h (* 10 page-height))
+             (staves (loop for part in (fset:convert 'list (score-protocol:score-parts view))
+                           sum (length (score-protocol:part-staves part))))
+             (mw (* 4 scale))
+             (sh (/ (* (+ (* 100 staves) 50) scale) 100))
+             (per-system (max 1 (floor (- w left right) mw)))
+             (per-page (max 1 (floor (- h top bottom) sh)))
+             (measures (fset:convert 'list (score-protocol:score-measure-map view)))
+             (breaks (layout-system-breaks layout))
+             (systems (if (eq breaks :auto)
+                          (%chunk measures per-system)
+                          (%break-systems measures breaks)))
+             (numbered (loop for system in systems for j from 1 collect (cons j system))))
+        (%make-frame :width w :height h :page-width page-width :page-height page-height
+                     :top top :left left :measure-width mw :system-height sh
+                     :rect-height (* staves scale) :systems systems
+                     :pages (or (%chunk numbered per-page) (list '())))))))
+
+;;; Classify: drawn or skipped, and where each drawn element goes ----------------------
+
+(defun %bar-measure-id (view bar)
+  "The id of the measure of BAR in VIEW, or NIL when BAR is not one of its bars."
+  (and (integerp bar)
+       (<= (score-protocol:score-first-bar view) bar (score-protocol:score-last-bar view))
+       (score-protocol:element-id (score-protocol:bar-measure view bar))))
+
+(defun %element-measure-id (view element)
+  "The id of the measure an event, chord-symbol anchor or spanner is drawn in
+(its bar's, its position's bar's, its START's bar's), or NIL."
+  (let ((position (typecase element
+                    (score-protocol:chord-symbol-anchor (score-protocol:anchor-position element))
+                    (t (score-protocol:element-position view (score-protocol:element-id element))))))
+    (and (consp position) (%bar-measure-id view (car position)))))
+
+(defun %holder-ids (view element)
+  "The ids of the holders of ELEMENT (file header): its parent; for an event and
+an anchor, the measure of its bar; for a spanner, its START element."
+  (let ((parent (score-protocol:element-parent view (score-protocol:element-id element))))
+    (remove nil
+            (list (and parent (score-protocol:element-id parent))
+                  (and (typep element '(or score-protocol:event score-protocol:chord-symbol-anchor))
+                       (%element-measure-id view element))
+                  (and (typep element 'score-protocol:spanner)
+                       (let ((start (score-protocol:find-element
+                                     view (score-protocol:spanner-start element) :errorp nil)))
+                         (and start (score-protocol:element-id start))))))))
+
+(defun %classify (engine view elements frame)
+  "Walk ELEMENTS (VIEW's, in document order) → (values skipped buckets), two
+EQUAL tables: SKIPPED holds the ids not drawn; BUCKETS maps (slot . key) to the
+drawn elements filed there, newest first. Slots: :PARTS (key NIL); :EVENTS and
+:ANCHORS (key a measure id); :SPANNERS (key a system number); :KIDS (key the
+parent's id). Signals UNSUPPORTED-NOTATION inside SKIP-ELEMENT. The tables are
+only ever looked up, never iterated into the output."
+  (let ((skipped (make-hash-table :test 'equal))
+        (buckets (make-hash-table :test 'equal))
+        (system-of (make-hash-table :test 'equal))
+        (unsupported (null-engine-unsupported engine)))
+    (loop for system in (%frame-systems frame)
+          for j from 1
+          do (dolist (measure system)
+               (setf (gethash (score-protocol:element-id measure) system-of) j)))
+    (flet ((file (slot key element)
+             (push element (gethash (cons slot key) buckets))))
+      (dolist (element elements)
+        (let ((id (score-protocol:element-id element)))
+          (cond ((some (lambda (holder) (gethash holder skipped)) (%holder-ids view element))
+                 (setf (gethash id skipped) t))
+                ((some (lambda (name) (typep element name)) unsupported)
+                 (restart-case
+                     (error 'unsupported-notation
+                            :engine engine
+                            :element-id id
+                            :kind (class-name (class-of element)))
+                   (skip-element ()
+                     :report "Draw the score without this element."
+                     (setf (gethash id skipped) t)))))
+          (unless (gethash id skipped)
+            (typecase element
+              (score-protocol:measure-info)  ; placed by the frame
+              (score-protocol:part (file :parts nil element))
+              ((or score-protocol:event score-protocol:chord-symbol-anchor)
+               (let ((measure (%element-measure-id view element)))
+                 (when measure
+                   (file (if (typep element 'score-protocol:event) :events :anchors)
+                         measure element))))
+              (score-protocol:spanner
+               (let* ((measure (%element-measure-id view element))
+                      (j (and measure (gethash measure system-of))))
+                 (when j (file :spanners j element))))
+              (t
+               (let ((parent (score-protocol:element-parent view id)))
+                 (when parent
+                   (file :kids (score-protocol:element-id parent) element)))))))))
+    (values skipped buckets)))
+
+(defun %bucket (buckets slot key)
+  "The elements filed under (SLOT . KEY), in document order."
+  (reverse (gethash (cons slot key) buckets)))
+
+;;; Emit ---------------------------------------------------------------------------------
+
+(defun %svg-node (name attrs children)
+  "MAKE-SVG-ELEMENT NAME with ATTRS, then CHILDREN (xml nodes) as its children,
+set at once so a long list never goes through APPLY."
+  (let ((element (make-svg-element name attrs)))
+    (setf (stack-xml:xml-element-children element) children)
+    element))
+
+(defun %emit-pages (frame skipped buckets)
+  "→ (values pages placed): the SVG-PAGEs, and an EQUAL table id → the number
+of the page its group is on, filled as each element group is made."
+  (let* ((placed (make-hash-table :test 'equal))
+         (mw (%frame-measure-width frame))
+         (rect-attrs (list (cons "width" (%svg-number mw))
+                           (cons "height" (%svg-number (%frame-rect-height frame))))))
+    (labels ((group (element k extra-attrs children)
+               (let ((id (score-protocol:element-id element)))
+                 (setf (gethash id placed) k)
+                 (%svg-node "g"
+                            (list* (cons "id" id)
+                                   (cons "class" (string-downcase (symbol-name (element-kind element))))
+                                   extra-attrs)
+                            children)))
+             (tree (element k)
+               (group element k '()
+                      (mapcar (lambda (child) (tree child k))
+                              (%bucket buckets :kids (score-protocol:element-id element)))))
+             (part-group (part)
+               (let ((name (score-protocol:part-name part)))
+                 (group part 1 '()
+                        (append (and name (list (make-svg-element "text" '() name)))
+                                (mapcar (lambda (child) (tree child 1))
+                                        (%bucket buckets :kids (score-protocol:element-id part)))))))
+             (measure-group (measure j k)
+               (let ((id (score-protocol:element-id measure)))
+                 (group measure k
+                        (list (cons "transform" (format nil "translate(~A,0)" (%svg-number (* j mw)))))
+                        (cons (make-svg-element "rect" rect-attrs)
+                              (mapcar (lambda (element) (tree element k))
+                                      (append (%bucket buckets :kids id)
+                                              (%bucket buckets :anchors id)
+                                              (%bucket buckets :events id)))))))
+             (system-group (number measures i k)
+               (%svg-node "g"
+                          (list (cons "id" (format nil "system.~D" number))
+                                (cons "class" "system")
+                                (cons "transform"
+                                      (format nil "translate(~A,~A)"
+                                              (%svg-number (%frame-left frame))
+                                              (%svg-number (+ (%frame-top frame)
+                                                              (* i (%frame-system-height frame)))))))
+                          (append
+                           (loop for measure in measures
+                                 for j from 0
+                                 unless (gethash (score-protocol:element-id measure) skipped)
+                                   collect (measure-group measure j k))
+                           (mapcar (lambda (spanner) (tree spanner k))
+                                   (%bucket buckets :spanners number)))))
+             (page (k systems)
+               (let ((root (%svg-node
+                            "svg"
+                            (list (cons "xmlns" +svg-namespace+)
+                                  (cons "viewBox" (format nil "0 0 ~A ~A"
+                                                          (%svg-number (%frame-width frame))
+                                                          (%svg-number (%frame-height frame))))
+                                  (cons "width" (format nil "~Amm" (%svg-number (%frame-page-width frame))))
+                                  (cons "height" (format nil "~Amm" (%svg-number (%frame-page-height frame))))
+                                  (cons "class" "engrave-page")
+                                  (cons "data-page" (format nil "~D" k)))
+                            (append
+                             (and (= k 1)
+                                  (list (%svg-node "g" (list (cons "class" "parts"))
+                                                   (mapcar #'part-group (%bucket buckets :parts nil)))))
+                             (loop for (number . measures) in systems
+                                   for i from 0
+                                   collect (system-group number measures i k))))))
+                 (make-svg-page :number k
+                                :document (stack-xml:make-xml-document :children (list root))
+                                :systems (loop for (nil . measures) in systems
+                                               collect (mapcar #'score-protocol:element-id measures))))))
+      (values (loop for systems in (%frame-pages frame)
+                    for k from 1
+                    collect (page k systems))
+              placed))))
+
 (defmethod engine-render-pages ((engine null-engine) view layout &key page)
-  (declare (ignore view layout page))
-  (%en0-pending 'engine-render-pages/null-engine))
+  ;; Every page is rendered whatever PAGE is (file header).
+  (declare (ignore page))
+  (let* ((elements (score-protocol:score-elements view))
+         (frame (%layout-frame view layout)))
+    (multiple-value-bind (skipped buckets) (%classify engine view elements frame)
+      (multiple-value-bind (pages placed) (%emit-pages frame skipped buckets)
+        (values pages
+                (let ((map (fset:empty-map)))
+                  (dolist (element elements map)
+                    (let* ((id (score-protocol:element-id element))
+                           (k (gethash id placed)))
+                      (setf map (fset:with map id (if k (list (cons k id)) '())))))))))))

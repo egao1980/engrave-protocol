@@ -85,12 +85,175 @@
   (id nil :type (or null string) :read-only t)
   (detail '() :type list :read-only t))
 
+(defun %items (object)
+  "The items of OBJECT read as a list: the elements of its conses, and a final
+non-NIL atom as one more item. So an atom is one item and NIL none."
+  (loop for tail = object then (cdr tail)
+        while (consp tail)
+        collect (car tail) into items
+        finally (return (if tail (append items (list tail)) items))))
+
+(defun %svg-root (document)
+  "DOCUMENT's root element when DOCUMENT is an SVG document (check 2), else NIL."
+  (let ((root (and (stack-xml:xml-document-p document)
+                   (stack-xml:document-root-element document))))
+    (and root
+         (string= "svg" (stack-xml:xml-element-local-name root))
+         (equal +svg-namespace+ (stack-xml:xml-element-namespace-uri root))
+         (%exact-attr root "viewBox")
+         (%exact-attr root "width")
+         (%exact-attr root "height")
+         root)))
+
 (defun check-engraving (score pages id-map &key (view :choral) parts)
   "Conformance issues of a whole rendering of SCORE (file header)."
-  (declare (ignore score pages id-map view parts))
-  (%en0-pending 'check-engraving))
+  (multiple-value-bind (v view-map) (engrave-view score :view view :parts parts)
+    (let* ((expected (loop for element in (score-protocol:score-elements v)
+                           for (source found) = (multiple-value-list
+                                                 (fset:lookup view-map (score-protocol:element-id element)))
+                           when found collect source))
+           ;; Page facts, once: (number root ids), ROOT NIL for a page that is not SVG.
+           (facts (mapcar (lambda (page)
+                            (let ((root (%svg-root (svg-page-document page))))
+                              (list (svg-page-number page) root (and root (svg-page-ids page)))))
+                          pages))
+           (svg-facts (remove nil facts :key #'second))
+           (issues '()))
+      (flet ((issue (kind id &rest detail)
+               (push (make-engraving-issue :kind kind :id id :detail detail) issues)))
+        ;; 1 :PAGE-NUMBER, the first page out of place.
+        (loop for (number) in facts
+              for i from 0
+              unless (eql number (1+ i))
+                do (issue :page-number nil :index i :number number)
+                   (return))
+        ;; 2 :NOT-SVG
+        (loop for (number root) in facts
+              unless root do (issue :not-svg nil :page number))
+        ;; 3 :NAMESPACE, below the root.
+        (loop for (number root) in svg-facts
+              do (dolist (child (stack-xml:xml-element-children root))
+                   (%walk-elements (lambda (element)
+                                     (unless (equal +svg-namespace+
+                                                    (stack-xml:xml-element-namespace-uri element))
+                                       (issue :namespace (%svg-id element)
+                                              :page number
+                                              :element (stack-xml:xml-element-local-name element))))
+                                   child)))
+        ;; 4 :INVALID-SVG-ID
+        (loop for (number nil ids) in svg-facts
+              do (dolist (id ids)
+                   (unless (valid-svg-id-p id)
+                     (issue :invalid-svg-id id :page number))))
+        ;; 5 :DUPLICATE-SVG-ID, over all pages.
+        (let ((seen (make-hash-table :test 'equal)))
+          (loop for (number nil ids) in svg-facts
+                do (dolist (id ids)
+                     (if (gethash id seen)
+                         (issue :duplicate-svg-id id :page number)
+                         (setf (gethash id seen) t)))))
+        ;; 6 :MISSING-ELEMENT
+        (dolist (id expected)
+          (unless (nth-value 1 (fset:lookup id-map id))
+            (issue :missing-element id)))
+        ;; 7 :UNKNOWN-ELEMENT, sorted.
+        (let ((wanted (make-hash-table :test 'equal))
+              (unknown '()))
+          (dolist (id expected) (setf (gethash id wanted) t))
+          (fset:do-map (id refs id-map)
+            (declare (ignore refs))
+            (unless (gethash id wanted) (push id unknown)))
+          (dolist (id (sort unknown #'string<))
+            (issue :unknown-element id)))
+        ;; 8 :NOT-DRAWN
+        (dolist (id expected)
+          (multiple-value-bind (refs found) (fset:lookup id-map id)
+            (when (and found (null refs))
+              (issue :not-drawn id))))
+        ;; 9 :DANGLING-REF. Page number → EQUAL set of its ids (empty for a page
+        ;; that is not SVG); pages sharing a number pool their ids.
+        (let ((sets (make-hash-table)))
+          (loop for (number nil ids) in facts
+                do (let ((set (or (gethash number sets)
+                                  (setf (gethash number sets) (make-hash-table :test 'equal)))))
+                     (dolist (id ids) (setf (gethash id set) t))))
+          (dolist (id expected)
+            (multiple-value-bind (refs found) (fset:lookup id-map id)
+              (when found
+                (dolist (item (%items refs))
+                  (unless (and (consp item)
+                               (stringp (cdr item))
+                               (let ((set (gethash (car item) sets)))
+                                 (and set (gethash (cdr item) set))))
+                    (issue :dangling-ref id :ref item)))))))
+        ;; 10 :SYSTEMS
+        (let ((wanted (%measure-ids v))
+              (actual (loop for page in pages
+                            append (loop for system in (%items (svg-page-systems page))
+                                         append (%items system)))))
+          (unless (equal wanted actual)
+            (issue :systems nil :expected wanted :actual actual))))
+      (nreverse issues))))
+
+(defun %positions-by-id (timemap reader)
+  "An EQUAL table: id → the indices of the entries of TIMEMAP whose READER list
+holds it, in entry order, once per occurrence."
+  (let ((table (make-hash-table :test 'equal)))
+    (loop for entry in timemap
+          for i from 0
+          do (dolist (id (funcall reader entry))
+               (push i (gethash id table))))
+    (maphash (lambda (id indices) (setf (gethash id table) (reverse indices))) table)
+    table))
+
+(defun %unfolded-counts (score)
+  "An EQUAL table: source event id → how many events of (unfold SCORE) its id
+map sends to it."
+  (let ((counts (make-hash-table :test 'equal)))
+    (multiple-value-bind (view id-map) (score-protocol:unfold score)
+      (dolist (element (score-protocol:score-elements view) counts)
+        (when (typep element 'score-protocol:event)
+          (multiple-value-bind (source found)
+              (fset:lookup id-map (score-protocol:element-id element))
+            (when found (incf (gethash source counts 0)))))))))
 
 (defun check-timemap (score timemap &key (unfold t))
   "Conformance issues of a timemap of SCORE (file header)."
-  (declare (ignore score timemap unfold))
-  (%en0-pending 'check-timemap))
+  (check-type score score-protocol:score)
+  (let* ((timed (mapcar #'score-protocol:element-id
+                        (remove-if-not #'%timed-event-p (score-protocol:score-elements score))))
+         (timed-set (let ((set (make-hash-table :test 'equal)))
+                      (dolist (id timed set) (setf (gethash id set) t))))
+         (ons (%positions-by-id timemap #'timemap-entry-on))
+         (offs (%positions-by-id timemap #'timemap-entry-off))
+         (counts (and unfold (%unfolded-counts score)))
+         (issues '()))
+    (flet ((issue (kind id &rest detail)
+             (push (make-engraving-issue :kind kind :id id :detail detail) issues)))
+      ;; 1 :ONSET-ORDER
+      (loop for (before entry) on timemap
+            for i from 1
+            while entry
+            unless (> (timemap-entry-onset entry) (timemap-entry-onset before))
+              do (issue :onset-order nil :entry i))
+      ;; 2 :UNKNOWN-EVENT, ON before OFF.
+      (loop for entry in timemap
+            for i from 0
+            do (dolist (id (append (timemap-entry-on entry) (timemap-entry-off entry)))
+                 (unless (gethash id timed-set)
+                   (issue :unknown-event id :entry i))))
+      ;; 3 :EVENT-COUNT
+      (dolist (id timed)
+        (let ((expected (if unfold (gethash id counts 0) 1))
+              (on (length (gethash id ons)))
+              (off (length (gethash id offs))))
+          (unless (= expected on off)
+            (issue :event-count id :expected expected :on on :off off))))
+      ;; 4 :OFF-BEFORE-ON, the first k whose OFF is at or before its ON.
+      (dolist (id timed)
+        (loop for i in (gethash id ons)
+              for j in (gethash id offs)
+              when (<= j i)
+                do (issue :off-before-on id :on i :off j)
+                   (return))))
+    (nreverse issues)))
